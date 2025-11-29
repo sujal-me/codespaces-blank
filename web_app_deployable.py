@@ -30,8 +30,14 @@ import torch.nn.functional as F
 import torchvision.models as models
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import spacy
 import xml.etree.ElementTree as ET
+
+# Optional spacy import
+try:
+    import spacy
+    SPACY_AVAILABLE = True
+except ImportError:
+    SPACY_AVAILABLE = False
 
 # Optional imports for enhanced features
 try:
