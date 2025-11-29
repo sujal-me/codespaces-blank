@@ -382,6 +382,10 @@ def get_xray_model():
     
     model.eval()
     
+    # Convert to half precision (float16) to save memory
+    if DEVICE == 'cuda':
+        model = model.half()
+    
     _models_cache['xray_model'] = model
     _models_cache['xray_vocab'] = vocabulary
     return model, vocabulary
@@ -651,8 +655,13 @@ def generate_report():
     try:
         # Process image and generate caption
         image_tensor = process_image(file)
-        caption_words = xray_model.generate_caption(image_tensor.unsqueeze(0), max_length=25)
+        with torch.no_grad():
+            caption_words = xray_model.generate_caption(image_tensor.unsqueeze(0), max_length=25)
         caption = " ".join(caption_words)
+        
+        # Clear image tensor to free memory
+        del image_tensor
+        torch.cuda.empty_cache()
 
         # Generate detailed reports
         detailed_report_gpt2 = get_detailed_report_gpt2(caption)
@@ -678,6 +687,8 @@ def generate_report():
     except Exception as e:
         import traceback
         traceback.print_exc()
+        # Clear cache on error
+        torch.cuda.empty_cache()
         return jsonify({"error": str(e)}), 500
 
 
