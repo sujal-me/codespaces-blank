@@ -309,17 +309,18 @@ CORS(app)  # Enable CORS for all routes
 app.config["UPLOAD_FOLDER"] = "static/uploads"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
-# Global model variables
-model = None
-gpt2_tokenizer = None
-gpt2_model = None
+# Global model variables - lazy loaded on demand
+_models_cache = {}
+_api_configured = False
 
 
-def initialize_models():
-    """Initialize all models on startup - NO DATASET REQUIRED"""
-    global model, gpt2_tokenizer, gpt2_model
-
-    # Configure APIs
+def configure_apis():
+    """Configure external APIs on startup (lightweight)"""
+    global _api_configured
+    if _api_configured:
+        return
+    
+    # Configure Gemini API
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
     if GOOGLE_API_KEY and GEMINI_AVAILABLE:
         genai.configure(api_key=GOOGLE_API_KEY)
@@ -327,6 +328,7 @@ def initialize_models():
     else:
         print("⚠️ Gemini API not available")
 
+    # Configure HuggingFace
     hf_token = os.getenv("HF_TOKEN")
     if hf_token and HF_AVAILABLE:
         try:
@@ -334,11 +336,19 @@ def initialize_models():
             print("✅ HuggingFace login successful")
         except Exception as e:
             print(f"⚠️ HuggingFace login failed: {e}")
-
-    # Initialize vocabulary (NO DATASET NEEDED)
-    vocabulary = Vocabulary()
     
-    # Try to load vocabulary from JSON file first
+    _api_configured = True
+
+
+def get_xray_model():
+    """Lazy load X-Ray model on first use"""
+    if 'xray_model' in _models_cache:
+        return _models_cache['xray_model'], _models_cache['xray_vocab']
+    
+    print("Loading X-Ray report generation model...")
+    
+    # Initialize vocabulary
+    vocabulary = Vocabulary()
     vocab_loaded = vocabulary.load_from_json(VOCAB_FILE)
     
     # Load checkpoint
@@ -346,19 +356,13 @@ def initialize_models():
     if os.path.exists(CHECKPOINT_FILE):
         print(f"Loading checkpoint from {CHECKPOINT_FILE}")
         checkpoint = torch.load(CHECKPOINT_FILE, map_location=DEVICE, weights_only=False)
-        
-        # Try to load vocabulary from checkpoint if not loaded from JSON
         if not vocab_loaded:
             vocab_loaded = vocabulary.load_from_checkpoint(checkpoint)
-    else:
-        print(f"⚠️ No checkpoint found at {CHECKPOINT_FILE}")
-
+    
     if not vocab_loaded:
-        print("⚠️ Could not load vocabulary. Model will not work properly.")
-        print("   Please ensure vocab.json exists or checkpoint contains vocabulary.")
-
+        print("⚠️ Could not load vocabulary")
+    
     # Create model
-    print("Loading X-Ray report generation model...")
     model = EncoderDecoderNet(
         features_size=FEATURES_SIZE,
         embed_size=EMBED_SIZE,
@@ -368,29 +372,52 @@ def initialize_models():
         device=DEVICE
     )
     model = model.to(DEVICE)
-
-    # Load model weights from checkpoint
+    
     if checkpoint is not None:
         try:
             model.load_state_dict(checkpoint['state_dict'])
-            print("✅ Model weights loaded successfully")
+            print("✅ X-Ray model loaded successfully")
         except Exception as e:
             print(f"⚠️ Error loading model weights: {e}")
-
+    
     model.eval()
+    
+    _models_cache['xray_model'] = model
+    _models_cache['xray_vocab'] = vocabulary
+    return model, vocabulary
 
-    # Load GPT-2 for detailed reports
-    if GPT2_AVAILABLE:
-        try:
-            print("Loading GPT-2 model...")
-            gpt2_tokenizer = AutoTokenizer.from_pretrained("gpt2")
-            gpt2_model = AutoModelForCausalLM.from_pretrained("gpt2")
-            gpt2_model.eval()
-            print("✅ GPT-2 loaded successfully")
-        except Exception as e:
-            print(f"⚠️ GPT-2 loading failed: {e}")
 
-    print("✅ All models initialized (No dataset dependency)")
+def get_gpt2_model():
+    """Lazy load GPT-2 model on first use"""
+    if 'gpt2_model' in _models_cache:
+        return _models_cache['gpt2_tokenizer'], _models_cache['gpt2_model']
+    
+    if not GPT2_AVAILABLE:
+        return None, None
+    
+    try:
+        print("Loading GPT-2 model...")
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        model = AutoModelForCausalLM.from_pretrained("gpt2")
+        model.eval()
+        
+        # Move to CPU to save GPU memory if not available
+        if DEVICE == 'cpu':
+            model = model.to(DEVICE)
+        
+        print("✅ GPT-2 loaded successfully")
+        _models_cache['gpt2_tokenizer'] = tokenizer
+        _models_cache['gpt2_model'] = model
+        return tokenizer, model
+    except Exception as e:
+        print(f"⚠️ GPT-2 loading failed: {e}")
+        return None, None
+
+
+def initialize_models():
+    """Lightweight initialization - just configure APIs"""
+    configure_apis()
+    print("✅ API configuration complete (Models loaded on-demand)")
 
 
 def allowed_file(filename):
@@ -409,30 +436,36 @@ def process_image(file):
 
 
 def get_detailed_report_gpt2(caption, max_new_tokens=150):
-    """Generate detailed report using GPT-2"""
-    if not GPT2_AVAILABLE or gpt2_tokenizer is None or gpt2_model is None:
+    """Generate detailed report using GPT-2 (lazy loaded)"""
+    gpt2_tokenizer, gpt2_model = get_gpt2_model()
+    
+    if gpt2_tokenizer is None or gpt2_model is None:
         return "Detailed report generation not available."
 
-    prompt = (
-        "Given the following short AI-generated caption of a chest X-ray, write a detailed, "
-        "professional, patient-friendly radiology report with explanations, findings, and recommendations.\n"
-        f"Caption: {caption}\n"
-        "Explanation:"
-    )
-    input_ids = gpt2_tokenizer.encode(prompt, return_tensors="pt")
-    with torch.no_grad():
-        output_ids = gpt2_model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.9,
-            pad_token_id=gpt2_tokenizer.eos_token_id,
+    try:
+        prompt = (
+            "Given the following short AI-generated caption of a chest X-ray, write a detailed, "
+            "professional, patient-friendly radiology report with explanations, findings, and recommendations.\n"
+            f"Caption: {caption}\n"
+            "Explanation:"
         )
-    generated_text = gpt2_tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    detailed_report = generated_text.split("Explanation:")[-1].strip()
-    if not detailed_report:
-        detailed_report = "Explanation could not be generated at this time."
-    return detailed_report
+        input_ids = gpt2_tokenizer.encode(prompt, return_tensors="pt")
+        with torch.no_grad():
+            output_ids = gpt2_model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.9,
+                pad_token_id=gpt2_tokenizer.eos_token_id,
+            )
+        generated_text = gpt2_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        detailed_report = generated_text.split("Explanation:")[-1].strip()
+        if not detailed_report:
+            detailed_report = "Explanation could not be generated at this time."
+        return detailed_report
+    except Exception as e:
+        print(f"Error generating GPT-2 report: {e}")
+        return "Detailed report generation not available."
 
 
 def extract_clinical_terms(caption, max_terms=5):
@@ -574,7 +607,9 @@ def generate_report():
     Request: multipart/form-data with 'image' file
     Optional fields: 'name', 'age', 'verify' (boolean)
     """
-    if model is None:
+    # Lazy load model on first request
+    xray_model, vocabulary = get_xray_model()
+    if xray_model is None:
         return jsonify({"error": "Model not initialized"}), 500
 
     if "image" not in request.files:
@@ -600,7 +635,7 @@ def generate_report():
     try:
         # Process image and generate caption
         image_tensor = process_image(file)
-        caption_words = model.generate_caption(image_tensor.unsqueeze(0), max_length=25)
+        caption_words = xray_model.generate_caption(image_tensor.unsqueeze(0), max_length=25)
         caption = " ".join(caption_words)
 
         # Generate detailed reports

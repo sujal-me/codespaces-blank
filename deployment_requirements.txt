@@ -1,6 +1,7 @@
 # Deployment Requirements for Render
 # Chest X-Ray Report Generator API
 # NO DATASET DEPENDENCY VERSION
+# OPTIMIZED FOR MEMORY EFFICIENCY
 
 # Core Flask
 flask==3.0.0
@@ -20,11 +21,11 @@ numpy==1.26.2
 # PDF Generation
 reportlab==4.0.7
 
-# Optional - Enhanced Features (comment out if not needed)
-transformers==4.35.2
+# Optional - Enhanced Features (comment out if memory constrained)
+# transformers==4.35.2
 google-generativeai==0.3.1
 huggingface-hub==0.19.4
-spacy
+# spacy
 
 # Note: Run after install for spacy model:
 # python -m spacy download en_core_web_sm
