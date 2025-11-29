@@ -1,11 +1,12 @@
 """
 Deployable Flask API for Chest X-Ray Report Generation
-This is a self-contained, independent Flask application for Render deployment.
+MEMORY OPTIMIZED - Uses lazy loading + DistilGPT2 for 512MB RAM limit
 """
 
 import os
 import io
 import re
+import gc
 import json
 import html
 import string
@@ -19,10 +20,7 @@ from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.utils import ImageReader
 from dotenv import load_dotenv
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 import torch
 import torch.nn as nn
@@ -30,14 +28,6 @@ import torch.nn.functional as F
 import torchvision.models as models
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import xml.etree.ElementTree as ET
-
-# Optional spacy import
-try:
-    import spacy
-    SPACY_AVAILABLE = True
-except ImportError:
-    SPACY_AVAILABLE = False
 
 # Optional imports for enhanced features
 try:
@@ -46,11 +36,8 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
-try:
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    GPT2_AVAILABLE = True
-except ImportError:
-    GPT2_AVAILABLE = False
+# GPT2 will be lazy loaded - don't import at startup to save memory
+GPT2_AVAILABLE = True  # Will be checked when actually loading
 
 try:
     from huggingface_hub import login as hf_login
@@ -66,10 +53,14 @@ CHECKPOINT_FILE = './checkpoints/x_ray_model.pth.tar'
 VOCAB_FILE = './checkpoints/vocab.json'  # Optional: pre-saved vocabulary
 WEIGHTS_PATH = './weights/chexnet.pth.tar'
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+# Force CPU to save memory
+DEVICE = 'cpu'
 FEATURES_SIZE = 1024
 EMBED_SIZE = 300
 HIDDEN_SIZE = 256
+
+# Use DistilGPT2 (smaller than GPT2: 82M vs 124M params)
+GPT2_MODEL_NAME = "distilgpt2"
 
 basic_transforms = A.Compose([
     A.Resize(height=256, width=256),
@@ -78,6 +69,14 @@ basic_transforms = A.Compose([
 ])
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+
+
+# ==================== MEMORY MANAGEMENT ====================
+def clear_memory():
+    """Aggressively clear memory"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 # ==================== TEXT UTILITIES ====================
 def remove_special_chars(text):
@@ -310,23 +309,20 @@ class EncoderDecoderNet(nn.Module):
 
 
 # ==================== FLASK APP ====================
-app = Flask(__name__, static_folder='static', static_url_path='')
+app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 app.config["UPLOAD_FOLDER"] = "static/uploads"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
-# Global model variables - lazy loaded on demand
-_models_cache = {}
-_api_configured = False
+# Global model variables - only X-Ray model stays loaded
+model = None
 
 
-def configure_apis():
-    """Configure external APIs on startup (lightweight)"""
-    global _api_configured
-    if _api_configured:
-        return
-    
-    # Configure Gemini API
+def initialize_models():
+    """Initialize X-Ray model on startup - GPT2 will be lazy loaded"""
+    global model
+
+    # Configure APIs
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
     if GOOGLE_API_KEY and GEMINI_AVAILABLE:
         genai.configure(api_key=GOOGLE_API_KEY)
@@ -334,7 +330,6 @@ def configure_apis():
     else:
         print("⚠️ Gemini API not available")
 
-    # Configure HuggingFace
     hf_token = os.getenv("HF_TOKEN")
     if hf_token and HF_AVAILABLE:
         try:
@@ -342,19 +337,11 @@ def configure_apis():
             print("✅ HuggingFace login successful")
         except Exception as e:
             print(f"⚠️ HuggingFace login failed: {e}")
-    
-    _api_configured = True
 
-
-def get_xray_model():
-    """Lazy load X-Ray model on first use"""
-    if 'xray_model' in _models_cache:
-        return _models_cache['xray_model'], _models_cache['xray_vocab']
-    
-    print("Loading X-Ray report generation model...")
-    
-    # Initialize vocabulary
+    # Initialize vocabulary (NO DATASET NEEDED)
     vocabulary = Vocabulary()
+    
+    # Try to load vocabulary from JSON file first
     vocab_loaded = vocabulary.load_from_json(VOCAB_FILE)
     
     # Load checkpoint
@@ -362,13 +349,19 @@ def get_xray_model():
     if os.path.exists(CHECKPOINT_FILE):
         print(f"Loading checkpoint from {CHECKPOINT_FILE}")
         checkpoint = torch.load(CHECKPOINT_FILE, map_location=DEVICE, weights_only=False)
+        
+        # Try to load vocabulary from checkpoint if not loaded from JSON
         if not vocab_loaded:
             vocab_loaded = vocabulary.load_from_checkpoint(checkpoint)
-    
+    else:
+        print(f"⚠️ No checkpoint found at {CHECKPOINT_FILE}")
+
     if not vocab_loaded:
-        print("⚠️ Could not load vocabulary")
-    
+        print("⚠️ Could not load vocabulary. Model will not work properly.")
+        print("   Please ensure vocab.json exists or checkpoint contains vocabulary.")
+
     # Create model
+    print("Loading X-Ray report generation model...")
     model = EncoderDecoderNet(
         features_size=FEATURES_SIZE,
         embed_size=EMBED_SIZE,
@@ -378,56 +371,23 @@ def get_xray_model():
         device=DEVICE
     )
     model = model.to(DEVICE)
-    
+
+    # Load model weights from checkpoint
     if checkpoint is not None:
         try:
             model.load_state_dict(checkpoint['state_dict'])
-            print("✅ X-Ray model loaded successfully")
+            print("✅ Model weights loaded successfully")
         except Exception as e:
             print(f"⚠️ Error loading model weights: {e}")
-    
+
     model.eval()
     
-    # Convert to half precision (float16) to save memory
-    if DEVICE == 'cuda':
-        model = model.half()
-    
-    _models_cache['xray_model'] = model
-    _models_cache['xray_vocab'] = vocabulary
-    return model, vocabulary
+    # Free checkpoint memory
+    del checkpoint
+    clear_memory()
 
-
-def get_gpt2_model():
-    """Lazy load GPT-2 model on first use"""
-    if 'gpt2_model' in _models_cache:
-        return _models_cache['gpt2_tokenizer'], _models_cache['gpt2_model']
-    
-    if not GPT2_AVAILABLE:
-        return None, None
-    
-    try:
-        print("Loading GPT-2 model...")
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        model = AutoModelForCausalLM.from_pretrained("gpt2")
-        model.eval()
-        
-        # Move to CPU to save GPU memory if not available
-        if DEVICE == 'cpu':
-            model = model.to(DEVICE)
-        
-        print("✅ GPT-2 loaded successfully")
-        _models_cache['gpt2_tokenizer'] = tokenizer
-        _models_cache['gpt2_model'] = model
-        return tokenizer, model
-    except Exception as e:
-        print(f"⚠️ GPT-2 loading failed: {e}")
-        return None, None
-
-
-def initialize_models():
-    """Lightweight initialization - just configure APIs"""
-    configure_apis()
-    print("✅ API configuration complete (Models loaded on-demand)")
+    # NOTE: GPT-2 is NOT loaded here - it will be lazy loaded when needed
+    print("✅ X-Ray model initialized (GPT-2 will be lazy loaded on demand)")
 
 
 def allowed_file(filename):
@@ -445,37 +405,65 @@ def process_image(file):
     return image
 
 
-def get_detailed_report_gpt2(caption, max_new_tokens=150):
-    """Generate detailed report using GPT-2 (lazy loaded)"""
-    gpt2_tokenizer, gpt2_model = get_gpt2_model()
-    
-    if gpt2_tokenizer is None or gpt2_model is None:
+def get_detailed_report_gpt2(caption, max_new_tokens=100):
+    """
+    Generate detailed report using DistilGPT2 with LAZY LOADING
+    Model is loaded on demand, used, then immediately unloaded to save memory
+    """
+    if not GPT2_AVAILABLE:
         return "Detailed report generation not available."
 
     try:
-        prompt = (
-            "Given the following short AI-generated caption of a chest X-ray, write a detailed, "
-            "professional, patient-friendly radiology report with explanations, findings, and recommendations.\n"
-            f"Caption: {caption}\n"
-            "Explanation:"
+        # Lazy import transformers only when needed
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        
+        print(f"📥 Loading {GPT2_MODEL_NAME} (lazy loading)...")
+        
+        # Load model with memory optimization
+        tokenizer = AutoTokenizer.from_pretrained(GPT2_MODEL_NAME)
+        gpt2_model = AutoModelForCausalLM.from_pretrained(
+            GPT2_MODEL_NAME,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
         )
-        input_ids = gpt2_tokenizer.encode(prompt, return_tensors="pt")
+        gpt2_model.eval()
+        
+        # Generate report
+        prompt = f"Chest X-ray findings: {caption}\nDetailed radiology report:"
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=100, truncation=True)
+        
         with torch.no_grad():
             output_ids = gpt2_model.generate(
-                input_ids,
+                inputs.input_ids,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
-                temperature=0.9,
-                pad_token_id=gpt2_tokenizer.eos_token_id,
+                temperature=0.7,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id,
+                no_repeat_ngram_size=3
             )
-        generated_text = gpt2_tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        detailed_report = generated_text.split("Explanation:")[-1].strip()
+        
+        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        detailed_report = generated_text.split("Detailed radiology report:")[-1].strip()
+        
         if not detailed_report:
             detailed_report = "Explanation could not be generated at this time."
+        
+        # IMMEDIATELY unload model to free memory
+        del gpt2_model
+        del tokenizer
+        del inputs
+        del output_ids
+        clear_memory()
+        
+        print("✅ DistilGPT2 unloaded (memory freed)")
+        
         return detailed_report
+        
     except Exception as e:
-        print(f"Error generating GPT-2 report: {e}")
-        return "Detailed report generation not available."
+        print(f"⚠️ GPT-2 lazy loading error: {e}")
+        clear_memory()
+        return "Detailed report generation failed."
 
 
 def extract_clinical_terms(caption, max_terms=5):
@@ -593,22 +581,30 @@ def verify_xray_image(image_file):
 # ==================== API ROUTES ====================
 
 @app.route("/", methods=["GET"])
-def serve_index():
-    """Serve the main UI"""
-    return send_from_directory('static', 'index.html')
-
-
-@app.route('/<path:path>')
-def serve_static(path):
-    """Serve static files (CSS, JS, images, etc.)"""
-    if os.path.exists(os.path.join('static', path)):
-        return send_from_directory('static', path)
-    # If file not found, serve index.html (for SPA routing)
-    return send_from_directory('static', 'index.html')
+def home():
+    """Serve the frontend index page (static/index.html)"""
+    try:
+        # serve the static index.html file (Flask serves from `static/` by default)
+        return send_from_directory(app.static_folder or 'static', 'index.html')
+    except Exception:
+        # Fallback: simple JSON response if index.html is not available
+        return jsonify({
+            "status": "healthy",
+            "message": "Chest X-Ray Report Generator API",
+            "version": "2.0.0",
+            "note": "No dataset dependency - index.html missing",
+            "endpoints": {
+                "/": "Frontend (GET) - serves index.html",
+                "/api/health": "Health check (GET)",
+                "/api/generate": "Generate report from X-ray image (POST)",
+                "/api/verify": "Verify if image is a chest X-ray (POST)",
+                "/api/download-pdf": "Download report as PDF (POST)"
+            }
+        }), 200
 
 
 @app.route("/api/health", methods=["GET"])
-def health_check():
+def health():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
@@ -616,11 +612,10 @@ def health_check():
         "version": "2.0.0",
         "note": "No dataset dependency - fully deployable",
         "endpoints": {
-            "/": "UI (GET)",
+            "/": "Frontend (GET) - serves index.html",
             "/api/generate": "Generate report from X-ray image (POST)",
             "/api/verify": "Verify if image is a chest X-ray (POST)",
-            "/api/download-pdf": "Download report as PDF (POST)",
-            "/api/health": "Health check (GET)"
+            "/api/download-pdf": "Download report as PDF (POST)"
         }
     })
 
@@ -633,9 +628,7 @@ def generate_report():
     Request: multipart/form-data with 'image' file
     Optional fields: 'name', 'age', 'verify' (boolean)
     """
-    # Lazy load model on first request
-    xray_model, vocabulary = get_xray_model()
-    if xray_model is None:
+    if model is None:
         return jsonify({"error": "Model not initialized"}), 500
 
     if "image" not in request.files:
@@ -661,13 +654,8 @@ def generate_report():
     try:
         # Process image and generate caption
         image_tensor = process_image(file)
-        with torch.no_grad():
-            caption_words = xray_model.generate_caption(image_tensor.unsqueeze(0), max_length=25)
+        caption_words = model.generate_caption(image_tensor.unsqueeze(0), max_length=25)
         caption = " ".join(caption_words)
-        
-        # Clear image tensor to free memory
-        del image_tensor
-        torch.cuda.empty_cache()
 
         # Generate detailed reports
         detailed_report_gpt2 = get_detailed_report_gpt2(caption)
@@ -693,8 +681,6 @@ def generate_report():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        # Clear cache on error
-        torch.cuda.empty_cache()
         return jsonify({"error": str(e)}), 500
 
 
