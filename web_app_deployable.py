@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 from datetime import datetime
 from collections import OrderedDict
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
@@ -304,7 +304,7 @@ class EncoderDecoderNet(nn.Module):
 
 
 # ==================== FLASK APP ====================
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app)  # Enable CORS for all routes
 app.config["UPLOAD_FOLDER"] = "static/uploads"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
@@ -583,7 +583,22 @@ def verify_xray_image(image_file):
 # ==================== API ROUTES ====================
 
 @app.route("/", methods=["GET"])
-def home():
+def serve_index():
+    """Serve the main UI"""
+    return send_from_directory('static', 'index.html')
+
+
+@app.route('/<path:path>')
+def serve_static(path):
+    """Serve static files (CSS, JS, images, etc.)"""
+    if os.path.exists(os.path.join('static', path)):
+        return send_from_directory('static', path)
+    # If file not found, serve index.html (for SPA routing)
+    return send_from_directory('static', 'index.html')
+
+
+@app.route("/api/health", methods=["GET"])
+def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
@@ -591,10 +606,11 @@ def home():
         "version": "2.0.0",
         "note": "No dataset dependency - fully deployable",
         "endpoints": {
-            "/": "Health check (GET)",
+            "/": "UI (GET)",
             "/api/generate": "Generate report from X-ray image (POST)",
             "/api/verify": "Verify if image is a chest X-ray (POST)",
-            "/api/download-pdf": "Download report as PDF (POST)"
+            "/api/download-pdf": "Download report as PDF (POST)",
+            "/api/health": "Health check (GET)"
         }
     })
 
