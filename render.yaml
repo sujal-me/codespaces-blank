@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: chest-xray-api
+    runtime: python
+    runtimeVersion: 3.12
+    
+    # Build configuration
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r deployment_requirements.txt
+      python -m spacy download en_core_web_sm
+    
+    # Start command
+    startCommand: gunicorn --workers 1 --worker-class sync --timeout 120 --bind 0.0.0.0:$PORT web_app_deployable:app
+    
+    # Environment variables
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12
+      - key: PORT
+        value: 8000
+      - key: FLASK_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        value: ${GEMINI_API_KEY}  # Add this in Render dashboard
+      - key: HF_TOKEN
+        value: ${HF_TOKEN}        # Optional: Add if using Hugging Face models
+    
+    # Health check
+    healthCheckPath: /health
+    
+    # Resource allocation (adjust based on needs)
+    plan: standard
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+    
+    # Disk size
+    disk:
+      name: model-cache
+      mountPath: /var/lib/model-cache
+      sizeGB: 10
+    
+    # Cron jobs (optional - for periodic tasks)
+    # crons:
+    #   - id: cleanup-uploads
+    #     schedule: "0 2 * * *"  # Daily at 2 AM
+    #     command: python -c "import os, shutil; [shutil.rmtree(f) for f in os.listdir('static/uploads') if os.path.isdir(f)]"
